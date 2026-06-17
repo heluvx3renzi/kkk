@@ -1,0 +1,31 @@
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "openrouter/qwen/qwen3-next-80b-a3b-instruct:free" },
+      "thinkingDefault": "off"
+    }
+  },
+  "gateway": { "mode": "local" },
+  "tools": {
+    "web": { "search": { "provider": "tavily" } }
+  },
+  "plugins": {
+    "load": { "paths": ["/app/plugins/agent-stub"] },
+    "entries": {
+      "openrouter": { "enabled": true },
+      "telegram": { "enabled": true },
+      "tavily": { "enabled": true },
+      "agentstub": { "enabled": true }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
+      "streaming": { "mode": "off" },
+      "errorPolicy": "silent"
+    }
+  },
+  "commands": { "text": true }
+}
