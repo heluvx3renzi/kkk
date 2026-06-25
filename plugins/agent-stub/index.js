@@ -167,7 +167,9 @@ function truncateForTelegram(text) {
   return text.slice(0, TELEGRAM_TEXT_LIMIT - marker.length) + marker;
 }
 
-// ── отправка черновика пользователю с inline-кнопками (нативный Telegram Bot API) ──
+// ── отправка черновика пользователю с inline-кнопками ──
+// callback_data в формате "editor:action" — namespace "editor" обрабатывается
+// через registerInteractiveHandler ниже (штатный механизм OpenClaw для кнопок).
 async function sendDraftWithButtons(chatId, text) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   if (!botToken) throw new Error("TELEGRAM_BOT_TOKEN не задан");
@@ -181,8 +183,8 @@ async function sendDraftWithButtons(chatId, text) {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: "✅ Опубликовать", callback_data: "publish" },
-            { text: "✏️ Отклонить", callback_data: "reject" },
+            { text: "✅ Опубликовать", callback_data: "editor:publish" },
+            { text: "✏️ Отклонить", callback_data: "editor:reject" },
           ],
         ],
       },
@@ -230,66 +232,62 @@ export default definePluginEntry({
       }),
     });
 
-    // ── ЖИВОЕ: обрабатываем нажатия inline-кнопок (Telegram callback_query) ──
-    // Документация OpenClaw: "Callback clicks are passed to the agent as text:
-    // callback_data: <value>". Поддерживаем оба формата на входе — на случай,
-    // если рантайм передаёт сырое поле callbackData/callback_data в event,
-    // либо текстом "callback_data: <value>".
-    api.on("before_dispatch", async (event, ctx) => {
-      const rawCallback =
-        event?.callbackData ??
-        event?.callback_data ??
-        event?.callbackQuery?.data ??
-        null;
+    // ── обработка нажатий inline-кнопок через штатный механизм OpenClaw ──
+    if (typeof api.registerInteractiveHandler === "function") {
+      api.registerInteractiveHandler({
+        channel: "telegram",
+        namespace: "editor",
+        handler: async (ctx) => {
+          const action = ctx?.callback?.payload;
+          const chatId =
+            ctx?.callback?.chatId ??
+            ctx?.chatId ??
+            ctx?.senderId ??
+            ctx?.userId ??
+            "default";
+          const sessionKey = String(chatId);
+          const session = getSession(sessionKey);
+          const callbackQueryId = ctx?.callback?.id ?? ctx?.callbackQueryId ?? null;
 
-      const text = String(event?.content ?? event?.body ?? "").trim();
-      const callbackMatch = text.match(/^callback_data:\s*(.+)$/i);
-      const callbackValue = rawCallback || (callbackMatch ? callbackMatch[1].trim() : null);
+          try {
+            if (action === "publish") {
+              if (!session.draft) {
+                await answerCallbackQuery(callbackQueryId, "Нет черновика для публикации");
+                return { text: "Сначала нужна тема — нет черновика для публикации." };
+              }
+              await publishToChannel(session.draft);
+              session.status = "published";
+              await answerCallbackQuery(callbackQueryId, "Опубликовано");
+              return { text: "Опубликовано в канал." };
+            }
 
-      if (!callbackValue) return; // не callback — пропускаем дальше во второй хук
+            if (action === "reject") {
+              if (!session.draft) {
+                await answerCallbackQuery(callbackQueryId, "Нет черновика");
+                return { text: "Нет черновика, который можно отклонить." };
+              }
+              session.awaitingFeedback = true;
+              await answerCallbackQuery(callbackQueryId, "Жду замечание");
+              return { text: "Напишите замечание — что исправить в статье." };
+            }
 
-      const sessionKey = String(
-        event?.senderId ?? event?.chatId ?? event?.userId ?? ctx?.sessionKey ?? "default"
-      );
-      const chatId = event?.senderId ?? event?.chatId ?? event?.userId ?? sessionKey;
-      const session = getSession(sessionKey);
-      const callbackQueryId = event?.callbackQuery?.id ?? event?.callbackQueryId ?? null;
-
-      try {
-        if (callbackValue === "publish") {
-          if (!session.draft) {
-            await answerCallbackQuery(callbackQueryId, "Нет черновика для публикации");
-            return { handled: true, text: "Сначала нужна тема — нет черновика для публикации." };
+            await answerCallbackQuery(callbackQueryId, null);
+            return { text: "Неизвестное действие." };
+          } catch (err) {
+            api.logger?.error?.(`agentstub callback error: ${err?.message || err}`);
+            return { text: `Ошибка: ${err?.message || err}` };
           }
-          await publishToChannel(session.draft);
-          session.status = "published";
-          await answerCallbackQuery(callbackQueryId, "Опубликовано");
-          return { handled: true, text: "Опубликовано в канал." };
-        }
-
-        if (callbackValue === "reject") {
-          if (!session.draft) {
-            await answerCallbackQuery(callbackQueryId, "Нет черновика");
-            return { handled: true, text: "Нет черновика, который можно отклонить." };
-          }
-          session.awaitingFeedback = true;
-          await answerCallbackQuery(callbackQueryId, "Жду замечание");
-          return { handled: true, text: "Напишите замечание — что исправить в статье." };
-        }
-
-        await answerCallbackQuery(callbackQueryId, null);
-        return { handled: true, text: "Неизвестное действие." };
-      } catch (err) {
-        api.logger?.error?.(`agentstub callback error: ${err?.message || err}`);
-        return { handled: true, text: `Ошибка: ${err?.message || err}` };
-      }
-    });
+        },
+      });
+      api.logger?.info?.("agentstub: registerInteractiveHandler зарегистрирован (namespace=editor)");
+    } else {
+      api.logger?.warn?.("agentstub: api.registerInteractiveHandler отсутствует в этой версии SDK!");
+    }
 
     // ── обычный текстовый ввод: тема статьи или замечание после "Отклонить" ──
     api.on("before_dispatch", async (event, ctx) => {
       const text = String(event?.content ?? event?.body ?? "").trim();
       if (!text || text.startsWith("/")) return; // команды и пустое — мимо
-      if (/^callback_data:/i.test(text)) return; // уже обработано первым хуком
 
       const sessionKey = String(
         event?.senderId ?? event?.chatId ?? event?.userId ?? ctx?.sessionKey ?? "default"
