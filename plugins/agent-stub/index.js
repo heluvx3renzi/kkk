@@ -90,7 +90,7 @@ async function generateArticle({ topic, description, sources, feedback, previous
 - [название] — [URL]
 
 Правила:
-- Объём: 600–900 слов (без учёта заголовков и списка источников).
+- Объём: строго 600–900 слов (без учёта заголовков и списка источников). НЕ превышай 900 слов даже если попросят "длиннее" или "подробнее" — вместо увеличения объёма делай текст более насыщенным по содержанию.
 - Тон: профессиональный, без воды.
 - Каждый факт или утверждение должны опираться на один из предоставленных источников; ставь ссылку в формате [1], [2] сразу после утверждения.
 - Не выдумывай факты и не используй источники, которых нет в списке.
@@ -145,7 +145,7 @@ async function publishToChannel(text) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: channelId,
-      text,
+      text: truncateForTelegram(text),
     }),
   });
 
@@ -155,12 +155,58 @@ async function publishToChannel(text) {
 }
 
 function draftReplyText(draft) {
-  return (
-    `${draft}\n\n` +
-    `---\n` +
-    `Команды: отправьте "опубликовать" чтобы выложить статью в канал,\n` +
-    `или "отклонить: <замечание>" чтобы получить новый черновик с учётом правки.`
-  );
+  return draft; // кнопки идут отдельным сообщением через sendDraftWithButtons
+}
+
+// Telegram ограничивает текст одного сообщения 4096 символами.
+const TELEGRAM_TEXT_LIMIT = 4096;
+
+function truncateForTelegram(text) {
+  if (text.length <= TELEGRAM_TEXT_LIMIT) return text;
+  const marker = "\n\n…(сокращено для предпросмотра, полный текст уйдёт при публикации)";
+  return text.slice(0, TELEGRAM_TEXT_LIMIT - marker.length) + marker;
+}
+
+// ── отправка черновика пользователю с inline-кнопками (нативный Telegram Bot API) ──
+async function sendDraftWithButtons(chatId, text) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken) throw new Error("TELEGRAM_BOT_TOKEN не задан");
+
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: truncateForTelegram(text),
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Опубликовать", callback_data: "publish" },
+            { text: "✏️ Отклонить", callback_data: "reject" },
+          ],
+        ],
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Telegram sendMessage(buttons) error ${res.status}: ${await res.text()}`);
+  }
+}
+
+// ── ответ на callback_query, чтобы у Telegram не висели "часики" на кнопке ──
+async function answerCallbackQuery(callbackQueryId, text) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!botToken || !callbackQueryId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
+    });
+  } catch {
+    // best-effort, не критично если не получилось
+  }
 }
 
 export default definePluginEntry({
@@ -184,57 +230,95 @@ export default definePluginEntry({
       }),
     });
 
+    // ── ЖИВОЕ: обрабатываем нажатия inline-кнопок (Telegram callback_query) ──
+    // Документация OpenClaw: "Callback clicks are passed to the agent as text:
+    // callback_data: <value>". Поддерживаем оба формата на входе — на случай,
+    // если рантайм передаёт сырое поле callbackData/callback_data в event,
+    // либо текстом "callback_data: <value>".
     api.on("before_dispatch", async (event, ctx) => {
+      const rawCallback =
+        event?.callbackData ??
+        event?.callback_data ??
+        event?.callbackQuery?.data ??
+        null;
+
       const text = String(event?.content ?? event?.body ?? "").trim();
-      if (!text || text.startsWith("/")) return; // команды — мимо
+      const callbackMatch = text.match(/^callback_data:\s*(.+)$/i);
+      const callbackValue = rawCallback || (callbackMatch ? callbackMatch[1].trim() : null);
+
+      if (!callbackValue) return; // не callback — пропускаем дальше во второй хук
 
       const sessionKey = String(
-        event?.chatId ?? event?.userId ?? ctx?.sessionKey ?? "default"
+        event?.senderId ?? event?.chatId ?? event?.userId ?? ctx?.sessionKey ?? "default"
       );
+      const chatId = event?.senderId ?? event?.chatId ?? event?.userId ?? sessionKey;
       const session = getSession(sessionKey);
-      const lower = text.toLowerCase();
+      const callbackQueryId = event?.callbackQuery?.id ?? event?.callbackQueryId ?? null;
 
       try {
-        // ── согласие на публикацию ──
-        if (lower === "опубликовать" || lower === "publish") {
+        if (callbackValue === "publish") {
           if (!session.draft) {
+            await answerCallbackQuery(callbackQueryId, "Нет черновика для публикации");
             return { handled: true, text: "Сначала нужна тема — нет черновика для публикации." };
           }
           await publishToChannel(session.draft);
           session.status = "published";
+          await answerCallbackQuery(callbackQueryId, "Опубликовано");
           return { handled: true, text: "Опубликовано в канал." };
         }
 
-        // ── отклонение с замечанием ──
-        const rejectMatch = text.match(/^(отклонить|reject)\s*[:\-—]\s*(.+)/i);
-        if (rejectMatch) {
+        if (callbackValue === "reject") {
           if (!session.draft) {
-            return { handled: true, text: "Нет черновика, который можно отклонить — сначала задайте тему." };
+            await answerCallbackQuery(callbackQueryId, "Нет черновика");
+            return { handled: true, text: "Нет черновика, который можно отклонить." };
           }
-          const feedback = rejectMatch[2].trim();
+          session.awaitingFeedback = true;
+          await answerCallbackQuery(callbackQueryId, "Жду замечание");
+          return { handled: true, text: "Напишите замечание — что исправить в статье." };
+        }
+
+        await answerCallbackQuery(callbackQueryId, null);
+        return { handled: true, text: "Неизвестное действие." };
+      } catch (err) {
+        api.logger?.error?.(`agentstub callback error: ${err?.message || err}`);
+        return { handled: true, text: `Ошибка: ${err?.message || err}` };
+      }
+    });
+
+    // ── обычный текстовый ввод: тема статьи или замечание после "Отклонить" ──
+    api.on("before_dispatch", async (event, ctx) => {
+      const text = String(event?.content ?? event?.body ?? "").trim();
+      if (!text || text.startsWith("/")) return; // команды и пустое — мимо
+      if (/^callback_data:/i.test(text)) return; // уже обработано первым хуком
+
+      const sessionKey = String(
+        event?.senderId ?? event?.chatId ?? event?.userId ?? ctx?.sessionKey ?? "default"
+      );
+      const chatId = event?.senderId ?? event?.chatId ?? event?.userId ?? sessionKey;
+      const session = getSession(sessionKey);
+
+      try {
+        // ── замечание к черновику (после нажатия "Отклонить") ──
+        if (session.awaitingFeedback) {
+          session.awaitingFeedback = false;
           const newDraft = await generateArticle({
             topic: session.topic,
             description: session.description,
             sources: session.sources,
-            feedback,
+            feedback: text,
             previousDraft: session.draft,
           });
           session.draft = newDraft;
-          return { handled: true, text: draftReplyText(newDraft) };
+          await sendDraftWithButtons(chatId, newDraft);
+          return { handled: true, text: "" };
         }
 
-        if (lower === "отклонить" || lower === "reject") {
-          return {
-            handled: true,
-            text: "Напишите замечание в формате: «отклонить: <что исправить>».",
-          };
-        }
-
-        // ── новая тема (всё остальное) ──
+        // ── новая тема ──
         session.topic = text;
         session.description = "";
         session.draft = null;
         session.status = "draft";
+        session.awaitingFeedback = false;
 
         const sources = await searchSources(text);
         if (sources.length === 0) {
@@ -245,14 +329,11 @@ export default definePluginEntry({
         }
         session.sources = sources;
 
-        const draft = await generateArticle({
-          topic: text,
-          description: "",
-          sources,
-        });
+        const draft = await generateArticle({ topic: text, description: "", sources });
         session.draft = draft;
 
-        return { handled: true, text: draftReplyText(draft) };
+        await sendDraftWithButtons(chatId, draft);
+        return { handled: true, text: "" };
       } catch (err) {
         api.logger?.error?.(`agentstub error: ${err?.message || err}`);
         return {
